@@ -1,0 +1,33 @@
+# OpenWrt build artifacts
+openwrt/
+bin/
+build_dir/
+staging_dir/
+dl/
+tmp/
+logs/
+
+# Compiled files
+*.o
+*.ko
+*.so
+*.a
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+update-packages-tmp.sh
+
+# Local settings
+.claude/settings.local.json
