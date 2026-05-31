@@ -7,8 +7,16 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      device:
+        description: 'Target device'
+        required: false
+        type: choice
+        default: uf02
+        options:
+          - uf02
+          - uz801
       log_switch:
-        description: "Build logs"
+        description: "Build logs (verbose)"
         required: false
         default: false
         type: boolean
@@ -23,9 +31,10 @@ on:
 
 env:
   CONFIG_FILE: "config/msm8916.config"
-  REPO_URL: https://github.com/hkfuertes/msm8916-openwrt.git
+  REPO_URL: https://git.openwrt.org/openwrt/openwrt.git
   REPO_BRANCH: main
-  FEEDS_CONF: feeds.conf.default
+  MSM8916_REPO: https://github.com/hkfuertes/msm8916-openwrt.git
+  MSM8916_BRANCH: main
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
   KEEP_RELEASES: 20
@@ -40,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -57,6 +66,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
           TZ: ${{ env.TZ }}
         run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo apt update
           sudo apt purge -y python3-distutils || true
           sudo apt autoremove -y
@@ -65,16 +75,8 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
             python3-setuptools rsync swig unzip zlib1g-dev file wget \
             mkbootimg device-tree-compiler ccache
-          if command -v mkbootimg >/dev/null 2>&1; then
-            echo "mkbootimg found at: $(command -v mkbootimg)"
-          else
-            echo "❌ mkbootimg not found in PATH!"
-          fi
-
           if [[ -n "$TZ" ]]; then
             sudo timedatectl set-timezone "$TZ"
-          else
-            echo "TZ is not set, skipping timezone setup."
           fi
 
       - name: Ensure Python build tools
@@ -82,14 +84,38 @@ jobs:
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install Unidecode
 
-      - name: Clone OpenWrt source code (msm8916-openwrt-main)
+      - name: Clone OpenWrt source code (snapshot/main)
         run: |
-          git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" openwrt
+          git clone "$REPO_URL" openwrt
+          cd openwrt
+          git log -1 --oneline
 
-      - name: Apply msm8916 patches
+      - name: Clone MSM8916 patches and target files
         run: |
-          chmod +x scripts/apply_patches.sh
-          bash scripts/apply_patches.sh openwrt
+          git clone --depth 1 --branch "$MSM8916_BRANCH" "$MSM8916_REPO" msm8916-source
+          ls -la msm8916-source/
+
+      - name: Apply MSM8916 patches and load target
+        run: |
+          # Apply mac80211 patches using msm8916-openwrt's official script
+          chmod +x msm8916-source/apply_patches.sh
+          ./msm8916-source/apply_patches.sh openwrt
+
+          # Move msm89xx target into OpenWrt
+          if [ -d "msm8916-source/msm89xx" ]; then
+            mv msm8916-source/msm89xx openwrt/target/linux/msm89xx
+            echo "✅ Moved msm89xx target to openwrt/target/linux/"
+          fi
+
+          # Move msm8916 packages into OpenWrt
+          if [ -d "msm8916-source/packages" ]; then
+            mv msm8916-source/packages openwrt/package/msm8916
+            echo "✅ Moved packages to openwrt/package/msm8916"
+          fi
+
+          # Verify
+          ls -la openwrt/target/linux/msm89xx/ || echo "msm89xx target not found"
+          ls -la openwrt/package/msm8916/ || echo "msm8916 packages not found"
 
       - name: Move build dirs to /mnt/openwrt
         run: |
@@ -105,7 +131,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /mnt/openwrt/dl
-          key: ${{ runner.os }}-msm8916-${{ env.REPO_BRANCH }}-dl-${{ hashFiles('feeds.conf.default') }}
+          key: ${{ runner.os }}-msm8916-${{ env.REPO_BRANCH }}-dl-${{ hashFiles('config/msm8916.config') }}
           restore-keys: |
             ${{ runner.os }}-msm8916-${{ env.REPO_BRANCH }}-dl-
 
@@ -121,12 +147,12 @@ jobs:
         run: |
           mkdir -p "$CCACHE_DIR"
           ccache -M "$CCACHE_MAXSIZE"
-          echo "ccache dir: $CCACHE_DIR"
           ccache -s
 
       - name: Update & Install feeds
         working-directory: ./openwrt
         run: |
+          rm -rf tmp
           ./scripts/feeds update -a
           ./scripts/feeds install -a -f
 
@@ -136,32 +162,45 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/scripts/update-packages.sh
           bash $GITHUB_WORKSPACE/scripts/update-packages.sh
 
+      - name: Re-install feeds after third-party packages
+        working-directory: ./openwrt
+        run: |
+          ./scripts/feeds install -a -f
+
       - name: Copy configuration and defconfig
         run: |
-          cp -fv "${CONFIG_FILE}" openwrt/.config
+          # Use msm8916-source diffconfig as base, then merge our config
+          DEVICE="${{ inputs.device || 'uf02' }}"
+          BASE_CONFIG="msm8916-source/diffconfig_${DEVICE}"
+
+          if [ -f "$BASE_CONFIG" ]; then
+            echo "Using base diffconfig: $BASE_CONFIG"
+            cp -fv "$BASE_CONFIG" openwrt/.config
+            # Append our additional packages (passwall, homeproxy, etc.)
+            echo "" >> openwrt/.config
+            echo "# Additional packages from config/msm8916.config" >> openwrt/.config
+            cat "${CONFIG_FILE}" >> openwrt/.config
+          else
+            echo "WARNING: $BASE_CONFIG not found, using config/msm8916.config only"
+            cp -fv "${CONFIG_FILE}" openwrt/.config
+          fi
+
           cd openwrt && make defconfig
-          # Disable packages that fail to build on this target
-          sed -i '/CONFIG_PACKAGE_kmod-mt76/d' .config
-          sed -i '/CONFIG_PACKAGE_kmod-dahdi/d' .config
-          echo '# CONFIG_PACKAGE_kmod-mt76 is not set' >> .config
-          make defconfig
           [ -e .config ] && cp .config defconfig-final.config
 
       - name: Upload build config files
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: build-config
+          name: build-config-${{ inputs.device || 'uf02' }}
           path: |
             config/msm8916.config
             openwrt/defconfig-final.config
-            openwrt/feeds.conf.default
 
       - name: Download packages
         working-directory: ./openwrt
         run: |
-          make download -j4 V=s
-          # Remove small incomplete files <1KB
-          find dl -size -1024c -delete
+          make download -j8 V=s
+          find dl -size -1024c -exec rm -f {} \; || true
 
       - name: Compile OpenWrt firmware
         id: compile
@@ -177,7 +216,7 @@ jobs:
               exit 1
             }
           else
-            make -j$(nproc) IGNORE_ERRORS=m || {
+            make -j$(nproc) IGNORE_ERRORS=m || make -j1 IGNORE_ERRORS=m || {
               echo "Compile failed, disk usage diagnostics:"
               df -h
               du -h -d1 . | sort -h | tail -n 30
@@ -190,7 +229,6 @@ jobs:
           fi
           echo "FILE_DATE=_$(date +%Y%m%d%H%M)" >> "$GITHUB_ENV"
           echo "status=success" >> $GITHUB_OUTPUT
-          echo "ccache stats (env CCACHE_DIR=$CCACHE_DIR):"
           ccache -s || true
 
       - name: Save ccache
@@ -205,42 +243,56 @@ jobs:
         if: env.UPLOAD_FIRMWARE == 'true'
         run: |
           cd openwrt/bin/targets/*/*
+          rm -rf packages
           echo "FIRMWARE=$PWD" >> $GITHUB_ENV
 
       - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         if: env.UPLOAD_FIRMWARE == 'true'
         with:
           name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-          path: ${{ env.FIRMWARE }}/*
+          path: |
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-gpt_both0.bin
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-boot.img
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-system.img
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*.manifest
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-flash.sh
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-firmware.zip
 
       - name: Generate release tag and notes
         id: tag
-        if: env.UPLOAD_RELEASE == 'true'
+        if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
         run: |
-          echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+          echo "release_tag=$(date +"%Y.%m.%d-%H%M")-main" >> $GITHUB_OUTPUT
           cat <<EOF > release.txt
-          🚀 OpenWrt firmware for MSM8916 devices (main branch)
+          🚀 OpenWrt firmware for MSM8916 devices (main branch / snapshot)
           ----------------------
-          设备平台: MSM8916
+          设备: ${{ inputs.device || 'uf02' }}
           构建时间: $(date +"%Y-%m-%d %H:%M")
-          源码仓库: $REPO_URL
-          分支: $REPO_BRANCH
+          OpenWrt 源码: $REPO_URL
+          OpenWrt 分支: $REPO_BRANCH (snapshot)
+          MSM8916 补丁: $MSM8916_REPO
 
           集成软件:
           - PassWall (代理工具)
           - HomeProxy (代理工具)
+          - Xray-core
           - Argon 主题
           EOF
 
       - name: Publish GitHub Release
         uses: ncipollo/release-action@v1
-        if: env.UPLOAD_RELEASE == 'true'
+        if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
         with:
           tag: ${{ steps.tag.outputs.release_tag }}
           bodyFile: release.txt
           artifacts: |
-            ${{ env.FIRMWARE }}/*
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-gpt_both0.bin
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-boot.img
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-squashfs-system.img
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*.manifest
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-flash.sh
+            ${{ env.FIRMWARE }}/openwrt-msm89xx-*-firmware.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -253,7 +305,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cleanup old GitHub Releases
-        if: env.UPLOAD_RELEASE == 'true'
+        if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP_RELEASES: ${{ env.KEEP_RELEASES }}
